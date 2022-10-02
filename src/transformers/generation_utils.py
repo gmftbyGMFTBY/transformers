@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from .modeling_outputs import CausalLMOutputWithCrossAttentions, Seq2SeqLMOutput
 from .generation_beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
 from .generation_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from .generation_logits_process import (
@@ -63,6 +64,51 @@ from .utils import ModelOutput, logging
 
 
 logger = logging.get_logger(__name__)
+
+
+@dataclass
+class ContrastiveSearchEncoderDecoderOutput(ModelOutput):
+    """
+    Base class for outputs of decoder-only generation models using contrastive search.
+
+    Args:
+        sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            The generated sequences. The second dimension (sequence_length) is either equal to `max_length` or shorter
+            if all batches finished early due to the `eos_token_id`.
+        attentions (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_attentions=True` is passed or `config.output_attentions=True`):
+            Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
+            `torch.FloatTensor` of shape `(batch_size, num_heads, generated_length, sequence_length)`.
+        hidden_states (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
+            `torch.FloatTensor` of shape `(batch_size, generated_length, hidden_size)`.
+    """
+
+    sequences: torch.LongTensor = None
+    decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+
+@dataclass
+class ContrastiveSearchDecoderOnlyOutput(ModelOutput):
+    """
+    Base class for outputs of decoder-only generation models using contrastive search.
+
+    Args:
+        sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            The generated sequences. The second dimension (sequence_length) is either equal to `max_length` or shorter
+            if all batches finished early due to the `eos_token_id`.
+        attentions (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_attentions=True` is passed or `config.output_attentions=True`):
+            Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
+            `torch.FloatTensor` of shape `(batch_size, num_heads, generated_length, sequence_length)`.
+        hidden_states (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
+            `torch.FloatTensor` of shape `(batch_size, generated_length, hidden_size)`.
+    """
+
+    sequences: torch.LongTensor = None
+    # attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+
 
 
 @dataclass
@@ -900,6 +946,7 @@ class GenerationMixin:
         num_beams: Optional[int] = None,
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
+        penalty_alpha: Optional[float] = None,
         top_p: Optional[float] = None,
         typical_p: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
@@ -1295,6 +1342,9 @@ class GenerationMixin:
 
         # 6. determine generation mode
         is_constraint_gen_mode = constraints is not None or force_words_ids is not None
+        is_contrastive_search_gen_mode = (
+            num_beams > 1 and do_sample is False and penalty_alpha is not None and penalty_alpha > 0        
+        )
         is_greedy_gen_mode = (
             (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
         )
@@ -1302,12 +1352,12 @@ class GenerationMixin:
             (num_beams == 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
         )
         is_beam_gen_mode = (
-            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode and penalty_alpha <=0 
         )
         is_beam_sample_gen_mode = (
-            (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
+            (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode and penalty_alpha <= 0
         )
-        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode
+        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode and penalty_alpha <= 0
 
         if num_beam_groups > num_beams:
             raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
@@ -1354,6 +1404,28 @@ class GenerationMixin:
             # 10. run greedy search
             return self.greedy_search(
                 input_ids,
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                output_scores=output_scores,
+                return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
+                **model_kwargs,
+            )
+
+        elif is_contrastive_search_gen_mode:
+            
+            if num_return_sequences > 1:
+                raise ValueError(
+                    f"num_return_sequences has to be 1, but is {num_return_sequences} when doing greedy search."
+                )
+                
+            # 10. run greedy search
+            return self.contrastive_search(
+                input_ids,
+                top_k=num_beams,
+                penalty_alpha=penalty_alpha,
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
@@ -1598,6 +1670,249 @@ class GenerationMixin:
                 synced_gpus=synced_gpus,
                 **model_kwargs,
             )
+            
+    def contrastive_search(
+        self,
+        input_ids: torch.LongTensor,
+        top_k: Optional[int] = None,
+        penalty_alpha: Optional[float] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        synced_gpus: Optional[bool] = False,
+        **model_kwargs,
+    ) -> Union[GreedySearchOutput, torch.LongTensor]:
+        r"""
+        Generates sequences of token ids for models with a language modeling head using **contrastive search** and can be
+        used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+        Parameters:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            logits_processor (`LogitsProcessorList`, *optional*):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                used to modify the prediction scores of the language modeling head applied at each generation step.
+            stopping_criteria (`StoppingCriteriaList`, *optional*):
+                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                used to tell if the generation loop should stop.
+
+            max_length (`int`, *optional*, defaults to 20):
+                **DEPRECATED**. Use `logits_processor` or `stopping_criteria` directly to cap the number of generated
+                tokens. The maximum length of the sequence to be generated.
+            pad_token_id (`int`, *optional*):
+                The id of the *padding* token.
+            eos_token_id (`int`, *optional*):
+                The id of the *end-of-sequence* token.
+            output_attentions (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more details.
+            output_hidden_states (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
+                for more details.
+            output_scores (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the prediction scores. See `scores` under returned tensors for more details.
+            return_dict_in_generate (`bool`, *optional*, defaults to `False`):
+                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+            synced_gpus (`bool`, *optional*, defaults to `False`):
+                Whether to continue running the while loop until max_length (needed for ZeRO stage 3)
+            model_kwargs:
+                Additional model specific keyword arguments will be forwarded to the `forward` function of the model.
+                If model is an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+        Return:
+            [`~generation_utils.GreedySearchDecoderOnlyOutput`], [`~generation_utils.GreedySearchEncoderDecoderOutput`]
+            or `torch.LongTensor`: A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+            [`~generation_utils.GreedySearchDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+            `return_dict_in_generate=True` or a [`~generation_utils.GreedySearchEncoderDecoderOutput`] if
+            `model.config.is_encoder_decoder=True`.
+
+        Examples:
+
+        ```python
+        >>> from transformers import (
+        ...     AutoTokenizer,
+        ...     AutoModelForCausalLM,
+        ...     LogitsProcessorList,
+        ...     MinLengthLogitsProcessor,
+        ...     StoppingCriteriaList,
+        ...     MaxLengthCriteria,
+        ... )
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        >>> model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+        >>> # set pad_token_id to eos_token_id because GPT2 does not have a PAD token
+        >>> model.config.pad_token_id = model.config.eos_token_id
+
+        >>> input_prompt = "It might be possible to"
+        >>> input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
+
+        >>> # instantiate logits processors
+        >>> logits_processor = LogitsProcessorList(
+        ...     [
+        ...         MinLengthLogitsProcessor(10, eos_token_id=model.config.eos_token_id),
+        ...     ]
+        ... )
+        >>> stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=20)])
+
+        >>> outputs = model.greedy_search(
+        ...     input_ids, logits_processor=logits_processor, stopping_criteria=stopping_criteria
+        ... )
+
+        >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
+        ```"""
+        # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if max_length is not None:
+            warnings.warn(
+                "`max_length` is deprecated in this function, use"
+                " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+                UserWarning,
+            )
+            stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+        pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        output_scores = output_scores if output_scores is not None else self.config.output_scores
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
+        )
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+            )
+
+        # keep track of which sequences are already finished
+        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+
+        this_peer_finished = False  # used by synced_gpus only
+
+
+        # necessary placeholder for fast contrastive search
+        past_key_values = None
+        last_hidden_states = None
+        logit_for_next_step = None
+        step = 0
+        model_kwargs['use_cache'] = True
+
+        while True:
+            if synced_gpus:
+                # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                # The following logic allows an early break if all peers finished generating their sequence
+                this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                # send 0.0 if we finished, 1.0 otherwise
+                dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                # did all peers finish? the reduced sum will be 0.0 then
+                if this_peer_finished_flag.item() == 0.0:
+                    break
+
+            # prepare model inputs
+            model_kwargs['past_key_values'] = past_key_values
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+            if self.config.is_encoder_decoder:
+                next_tokens, past_key_values, last_hidden_states, logit_for_next_step, selected_scores, decoder_hidden_states_one_step = EncDecContrastiveDecodingOneStepFast(
+                    self,
+                    beam_width=top_k,
+                    penalty_alpha=penalty_alpha,
+                    last_hidden_states=last_hidden_states,
+                    logit_for_next_step=logit_for_next_step,
+                    first_step=step == 0,
+                    **model_inputs,
+                )
+            else:
+                next_tokens, past_key_values, last_hidden_states, logit_for_next_step, selected_scores, decoder_hidden_states_one_step = ContrastiveDecodingOneStepFast(
+                    self,
+                    beam_width=top_k,
+                    penalty_alpha=penalty_alpha,
+                    last_hidden_states=last_hidden_states,
+                    logit_for_next_step=logit_for_next_step,
+                    first_step=step == 0,
+                    **model_inputs,
+                )
+
+            if synced_gpus and this_peer_finished:
+                continue  # don't waste resources running the code we don't need
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (decoder_hidden_states_one_step)
+
+            # finished sentences should have their next token be a padding token
+            if eos_token_id is not None:
+                if pad_token_id is None:
+                    raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if self.config.is_encoder_decoder:
+                outputs = Seq2SeqLMOutput(
+                    past_key_values=past_key_values,
+                )
+            else:
+                outputs = CausalLMOutputWithCrossAttentions(
+                    past_key_values=past_key_values,
+                    attentions=model_kwargs['attention_mask']
+                )
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+            )
+
+            # if eos_token was found in one sentence, set sentence to finished
+            if eos_token_id is not None:
+                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+
+            # stop when each sentence is finished, or if we exceed the maximum length
+            if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+                if not synced_gpus:
+                    break
+                else:
+                    this_peer_finished = True
+
+            step += 1
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return ContrastiveSearchEncoderDecoderOutput(
+                    sequences=input_ids,
+                    decoder_hidden_states=decoder_hidden_states,
+                )
+            else:
+                return ContrastiveSearchDecoderOnlyOutput(
+                    sequences=input_ids,
+                    hidden_states=decoder_hidden_states,
+                )
+        else:
+            return input_ids
 
     def greedy_search(
         self,
@@ -3411,3 +3726,141 @@ def top_k_top_p_filtering(
         )
 
     return logits
+
+
+# ========== utils for contrastive search decoding method ========= #
+def ranking_fast(
+    context_hidden: torch.FloatTensor, 
+    next_hidden: torch.FloatTensor, 
+    next_top_k_probs: torch.FloatTensor, 
+    alpha: float, 
+    beam_width: int
+) -> Tuple[torch.FloatTensor]:
+    '''
+        context_hidden: bsz*beam x seqlen x embed_dim
+        next_hidden: bsz*beam x 1 x embed_dim
+        next_top_k_probs: bsz x beam
+    '''
+    _, context_len, embed_dim = context_hidden.size()
+    norm_context_hidden = context_hidden / context_hidden.norm(dim=2, keepdim=True)
+    norm_next_hidden = next_hidden / next_hidden.norm(dim=2, keepdim=True)
+    cosine_matrix = torch.matmul(norm_context_hidden, norm_next_hidden.transpose(1,2)).squeeze(-1)    # [B*K, S]
+    scores, _ = torch.max(cosine_matrix, dim=-1)    # [B*K]
+    next_top_k_probs = next_top_k_probs.view(-1)    # [B*K]
+    scores = (1.0 - alpha) * next_top_k_probs - alpha * scores 
+    scores = torch.stack(torch.split(scores, beam_width))    # [B, K]
+    selected_scores, selected_idx = scores.max(dim=-1)    # [B]
+    return selected_scores, selected_idx
+
+def ContrastiveDecodingOneStepFast(
+    model, 
+    beam_width: int = 1, 
+    penalty_alpha: float = 0., 
+    past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
+    last_hidden_states: torch.FloatTensor = None,
+    logit_for_next_step: torch.FloatTensor = None,
+    first_step: bool = False,
+    **model_inputs,
+) -> Tuple:
+    if first_step:
+        output = model(
+            **model_inputs,
+            past_key_values=past_key_values,
+            output_hidden_states=True
+        )
+        past_key_values = output.past_key_values
+        last_hidden_states = output.hidden_states[-1]    # [B, S, E]
+        logit_for_next_step = output.logits[:, -1, :]    # [B, V]
+    bsz, seqlen, embed_dim = last_hidden_states.size()
+
+    next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
+    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)    # [B, K]
+    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)    # [B, K]
+    past_key_values = enlarge_past_key_values(past_key_values, beam_width)
+
+    # build next attention mask
+    attention_mask = model_inputs['attention_mask']    # [B, S]
+    attention_mask = torch.cat([
+        attention_mask,
+        attention_mask.new_ones((bsz, 1))
+        ],
+        dim=-1
+    )
+    attention_mask = attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))    # [B*K, S+1]
+
+    next_model_inputs = {
+        'attention_mask': attention_mask,
+        'input_ids': top_k_ids.view(-1, 1),
+        'past_key_values': past_key_values,
+        'use_cache': True,
+        'output_hidden_states': True
+    }
+    # OPT model does not containthe position_ids
+    if 'position_ids' in model_inputs:
+        position_ids = model_inputs['position_ids'][:, -1] + 1    # [B]
+        position_ids = position_ids.unsqueeze(dim=-1).expand(-1, beam_width)    # [B, K]
+        position_ids = position_ids.reshape(-1, 1)
+        next_model_inputs['position_ids'] = position_ids
+    output = model(**next_model_inputs)
+    decoder_hidden_states = output.hidden_states
+    past_key_values = output.past_key_values
+    logits = output.logits[:, -1, :]    # [B*K, V]
+    next_hidden = output.hidden_states[-1]    # [B*K, 1, E]
+    context_hidden = last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz*beam_width, seqlen, embed_dim)    # [B*K, S, E]
+
+    selected_scores, selected_idx = ranking_fast(
+        context_hidden, 
+        next_hidden, 
+        top_k_probs,    # [B, K] 
+        penalty_alpha,
+        beam_width,
+    )     # [B]
+    # prepare for the next step
+    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)    # [B, 1]
+    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))    # [B, K, E]
+    next_hidden = next_hidden[range(bsz), selected_idx, :]    # [B, E]
+    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)    # [B, S, E]
+
+    decoder_hidden_states = []
+    for layer in output.hidden_states:
+        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))    # [B, K, E]
+        layer = layer[range(bsz), selected_idx, :]    # [B, E]
+        decoder_hidden_states.append(layer)
+
+    past_key_values = select_past_key_values(past_key_values, beam_width, selected_idx)
+    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]    # [B, V]
+    return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
+
+def enlarge_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
+    beam_width: int
+) -> Tuple[Tuple[torch.FloatTensor]]:
+    # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
+    new_key_values = []
+    for layer in past_key_values:
+        items = []
+        for item in layer:
+            # item is the key and value matrix
+            bsz, num_head, seq_len, esz = item.size()
+            item = item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz*beam_width, num_head, seq_len, esz)    # [bsz*beam, num_head, seq_len, esz]
+            items.append(item)
+        new_key_values.append(items)
+    return new_key_values
+
+def select_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
+    beam_width: int, 
+    selected_idx: torch.FloatTensor
+) -> Tuple[Tuple[torch.FloatTensor]]:
+    '''select_idx: [B]'''
+    new_key_values = []
+    for layer in past_key_values:
+        items = []
+        for item in layer:
+            bsz_and_beam, num_head, seq_len, esz = item.size()
+            bsz = int(bsz_and_beam//beam_width)
+            item = torch.stack(torch.split(item, beam_width, dim=0))    # [B, K, num_head, seq_len, esz] 
+            item = item[range(bsz), selected_idx, :, :, :]   # [B, num_head, seq_len, esz]
+            items.append(item)
+        new_key_values.append(items)
+    return new_key_values
