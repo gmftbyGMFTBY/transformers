@@ -3863,3 +3863,108 @@ def select_past_key_values(
             items.append(item)
         new_key_values.append(items)
     return new_key_values
+
+## encoder-decoder contrastive utils function
+def EncDecContrastiveDecodingOneStepFast(
+    model,
+    beam_width: int = 1,
+    penalty_alpha: float = 0.,
+    past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
+    last_hidden_states: torch.FloatTensor = None,
+    logit_for_next_step: torch.FloatTensor = None,
+    first_step: bool = False,
+    **model_inputs,
+    ):
+    # input_ids: [B, S]
+    if first_step:
+        output = model(
+            **model_inputs,
+            past_key_values=past_key_values,
+            output_hidden_states=True,
+            output_attentions=True
+        )
+        past_key_values = output.past_key_values
+        last_hidden_states = output.decoder_hidden_states[-1]    # [B, S, E]
+        logit_for_next_step = output.logits[:, -1, :]    # [B, V]
+    bsz, seqlen, embed_dim = last_hidden_states.size()
+
+    next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
+    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)    # [B, K]
+    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)    # [B, K]
+    past_key_values = encdec_enlarge_past_key_values(past_key_values, beam_width)
+
+    # build next attention mask
+    attention_mask = model_inputs['attention_mask']    # [B, S]
+    attention_mask = attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))    # [B*K, S]
+
+    next_model_inputs = {
+        'encoder_outputs': model_inputs['encoder_outputs'],
+        'decoder_input_ids': top_k_ids.contiguous().view(-1, 1),
+        'past_key_values': past_key_values,
+        'use_cache': True,
+        'output_hidden_states': True,
+        'attention_mask': attention_mask
+    }
+
+    output = model(**next_model_inputs)
+    past_key_values = output.past_key_values
+    logits = output.logits[:, -1, :]    # [B*K, V]
+    next_hidden = output.decoder_hidden_states[-1]    # [B*K, 1, E]
+    context_hidden = last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz*beam_width, seqlen, embed_dim)    # [B*K, S, E]
+
+    selected_scores, selected_idx = ranking_fast(
+        context_hidden,
+        next_hidden,
+        top_k_probs,    # [B, K]
+        penalty_alpha,
+        beam_width,
+    )     # [B]
+    # prepare for the next step
+    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)    # [B, 1]
+    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))    # [B, K, E]
+    next_hidden = next_hidden[range(bsz), selected_idx, :]    # [B, E]
+    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)    # [B, S, E]
+
+    decoder_hidden_states = []
+    for layer in output.decoder_hidden_states:
+        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))    # [B, K, E]
+        layer = layer[range(bsz), selected_idx, :]    # [B, E]
+        decoder_hidden_states.append(layer)
+
+    past_key_values = encdec_select_past_key_values(past_key_values, beam_width, selected_idx)
+    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]    # [B, V]
+    return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
+
+def encdec_enlarge_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
+    beam_width: int
+):
+    # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
+    new_key_values = []
+    for layer in past_key_values:
+        items = []
+        for item in layer:
+            # item is the key and value matrix
+            bsz, num_head, seq_len, esz = item.size()
+            item = item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz*beam_width, num_head, seq_len, esz)    # [bsz*beam, num_head, seq_len, esz]
+            items.append(item)
+        new_key_values.append(tuple(items))
+    return tuple(new_key_values)
+
+def encdec_select_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
+    beam_width: int, 
+    selected_idx: torch.FloatTensor
+):
+    '''select_idx: [B]'''
+    new_key_values = []
+    for layer in past_key_values:
+        items = []
+        for item in layer:
+            bsz_and_beam, num_head, seq_len, esz = item.size()
+            bsz = int(bsz_and_beam//beam_width)
+            item = torch.stack(torch.split(item, beam_width, dim=0)).contiguous()    # [B, K, num_head, seq_len, esz]
+            item = item[range(bsz), selected_idx, :, :, :]   # [B, num_head, seq_len, esz]
+            items.append(item)
+        new_key_values.append(items)
+    return new_key_values
