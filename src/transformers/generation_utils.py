@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from .modeling_outputs import CausalLMOutputWithCrossAttentions, Seq2SeqLMOutput
 from .generation_beam_constraints import Constraint, DisjunctiveConstraint, PhrasalConstraint
 from .generation_beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from .generation_logits_process import (
@@ -52,6 +51,7 @@ from .generation_stopping_criteria import (
     StoppingCriteriaList,
     validate_stopping_criteria,
 )
+from .modeling_outputs import CausalLMOutputWithCrossAttentions, Seq2SeqLMOutput
 from .models.auto import (
     MODEL_FOR_CAUSAL_IMAGE_MODELING_MAPPING,
     MODEL_FOR_CAUSAL_LM_MAPPING,
@@ -75,15 +75,17 @@ class ContrastiveSearchEncoderDecoderOutput(ModelOutput):
         sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             The generated sequences. The second dimension (sequence_length) is either equal to `max_length` or shorter
             if all batches finished early due to the `eos_token_id`.
-        attentions (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_attentions=True` is passed or `config.output_attentions=True`):
-            Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
-            `torch.FloatTensor` of shape `(batch_size, num_heads, generated_length, sequence_length)`.
-        hidden_states (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+        scores (`tuple(torch.FloatTensor)` *optional*, returned when `output_scores=True` is passed or when `config.output_scores=True`):
+            Processed prediction scores of the language modeling head (scores for each vocabulary token before SoftMax)
+            at each generation step. Tuple of `torch.FloatTensor` with up to `max_new_tokens` elements (one element for
+            each generated token), with each tensor of shape `(batch_size, config.vocab_size)`.
+        decoder_hidden_states (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
             `torch.FloatTensor` of shape `(batch_size, generated_length, hidden_size)`.
     """
 
     sequences: torch.LongTensor = None
+    scores: Optional[Tuple[torch.FloatTensor]] = None
     decoder_hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
 
 
@@ -96,19 +98,18 @@ class ContrastiveSearchDecoderOnlyOutput(ModelOutput):
         sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             The generated sequences. The second dimension (sequence_length) is either equal to `max_length` or shorter
             if all batches finished early due to the `eos_token_id`.
-        attentions (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_attentions=True` is passed or `config.output_attentions=True`):
-            Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
-            `torch.FloatTensor` of shape `(batch_size, num_heads, generated_length, sequence_length)`.
+        scores (`tuple(torch.FloatTensor)` *optional*, returned when `output_scores=True` is passed or when `config.output_scores=True`):
+            Processed prediction scores of the language modeling head (scores for each vocabulary token before SoftMax)
+            at each generation step. Tuple of `torch.FloatTensor` with up to `max_new_tokens` elements (one element for
+            each generated token), with each tensor of shape `(batch_size, config.vocab_size)`.
         hidden_states (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple (one element for each generated token) of tuples (one element for each layer of the decoder) of
             `torch.FloatTensor` of shape `(batch_size, generated_length, hidden_size)`.
     """
 
     sequences: torch.LongTensor = None
-    # attentions: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    scores: Optional[Tuple[torch.FloatTensor]] = None
     hidden_states: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-
-
 
 
 @dataclass
@@ -1343,21 +1344,42 @@ class GenerationMixin:
         # 6. determine generation mode
         is_constraint_gen_mode = constraints is not None or force_words_ids is not None
         is_contrastive_search_gen_mode = (
-            num_beams > 1 and do_sample is False and penalty_alpha is not None and penalty_alpha > 0        
+            top_k > 1 and do_sample is False and penalty_alpha is not None and penalty_alpha > 0
         )
         is_greedy_gen_mode = (
-            (num_beams == 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode
+            (num_beams == 1)
+            and (num_beam_groups == 1)
+            and do_sample is False
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
         )
         is_sample_gen_mode = (
-            (num_beams == 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode
+            (num_beams == 1)
+            and (num_beam_groups == 1)
+            and do_sample is True
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
         )
         is_beam_gen_mode = (
-            (num_beams > 1) and (num_beam_groups == 1) and do_sample is False and not is_constraint_gen_mode and penalty_alpha <=0 
+            (num_beams > 1)
+            and (num_beam_groups == 1)
+            and do_sample is False
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
         )
         is_beam_sample_gen_mode = (
-            (num_beams > 1) and (num_beam_groups == 1) and do_sample is True and not is_constraint_gen_mode and penalty_alpha <= 0
+            (num_beams > 1)
+            and (num_beam_groups == 1)
+            and do_sample is True
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
         )
-        is_group_beam_gen_mode = (num_beams > 1) and (num_beam_groups > 1) and not is_constraint_gen_mode and penalty_alpha <= 0
+        is_group_beam_gen_mode = (
+            (num_beams > 1)
+            and (num_beam_groups > 1)
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
+        )
 
         if num_beam_groups > num_beams:
             raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
@@ -1400,7 +1422,6 @@ class GenerationMixin:
                     f"num_return_sequences has to be 1, but is {num_return_sequences} when doing greedy search."
                 )
 
-            # 10. run greedy search
             return self.greedy_search(
                 input_ids,
                 logits_processor=logits_processor,
@@ -1414,16 +1435,15 @@ class GenerationMixin:
             )
 
         elif is_contrastive_search_gen_mode:
-            
+
             if num_return_sequences > 1:
                 raise ValueError(
                     f"num_return_sequences has to be 1, but is {num_return_sequences} when doing greedy search."
                 )
-                
-            # 10. run greedy search
+
             return self.contrastive_search(
                 input_ids,
-                top_k=num_beams,
+                top_k=top_k,
                 penalty_alpha=penalty_alpha,
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
@@ -1669,12 +1689,12 @@ class GenerationMixin:
                 synced_gpus=synced_gpus,
                 **model_kwargs,
             )
-            
+
     def contrastive_search(
         self,
         input_ids: torch.LongTensor,
-        top_k: Optional[int] = None,
-        penalty_alpha: Optional[float] = None,
+        top_k: Optional[int] = 1,
+        penalty_alpha: Optional[float] = 0,
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         max_length: Optional[int] = None,
@@ -1688,12 +1708,16 @@ class GenerationMixin:
         **model_kwargs,
     ) -> Union[GreedySearchOutput, torch.LongTensor]:
         r"""
-        Generates sequences of token ids for models with a language modeling head using **contrastive search** and can be
-        used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+        Generates sequences of token ids for models with a language modeling head using **contrastive search** and can
+        be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
 
         Parameters:
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
                 The sequence used as a prompt for the generation.
+            top_k (`int`, *optional*, defaults to 1):
+                The size of the candidate set that is used to re-rank for contrastive search
+            penalty_alpha (`float`, *optional*, defaults to 0):
+                The degeneration penalty for contrastive search; activate when it is larger than 0
             logits_processor (`LogitsProcessorList`, *optional*):
                 An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
                 used to modify the prediction scores of the language modeling head applied at each generation step.
@@ -1751,18 +1775,9 @@ class GenerationMixin:
 
         >>> input_prompt = "It might be possible to"
         >>> input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
-
-        >>> # instantiate logits processors
-        >>> logits_processor = LogitsProcessorList(
-        ...     [
-        ...         MinLengthLogitsProcessor(10, eos_token_id=model.config.eos_token_id),
-        ...     ]
-        ... )
         >>> stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=20)])
 
-        >>> outputs = model.greedy_search(
-        ...     input_ids, logits_processor=logits_processor, stopping_criteria=stopping_criteria
-        ... )
+        >>> outputs = model.contrastive_search(input_ids, stopping_criteria=stopping_criteria)
 
         >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
         ["It might be possible to get a better understanding of the nature of the problem, but it's not"]
@@ -1790,29 +1805,26 @@ class GenerationMixin:
 
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
-        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
-        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
-
-        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
-        if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
-            encoder_hidden_states = (
-                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
-            )
 
         # keep track of which sequences are already finished
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
 
         this_peer_finished = False  # used by synced_gpus only
 
-
-        # necessary placeholder for fast contrastive search
-        past_key_values = None
-        last_hidden_states = None
-        logit_for_next_step = None
+        # encode the prefix first and prepare model inputs
         step = 0
-        model_kwargs['use_cache'] = True
+        model_kwargs["use_cache"] = True
+        model_kwargs["past_key_values"] = None
+        model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        output = self(**model_inputs, output_hidden_states=True, output_attentions=True)
+        past_key_values = output.past_key_values
+        if self.config.is_encoder_decoder:
+            last_hidden_states = output.decoder_hidden_states[-1]  # [B, S, E]
+        else:
+            last_hidden_states = output.hidden_states[-1]  # [B, S, E]
+        logit_for_next_step = output.logits[:, -1, :]  # [B, V]
+        model_inputs["past_key_values"] = past_key_values
 
         while True:
             if synced_gpus:
@@ -1825,28 +1837,36 @@ class GenerationMixin:
                 if this_peer_finished_flag.item() == 0.0:
                     break
 
-            # prepare model inputs
-            model_kwargs['past_key_values'] = past_key_values
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
             if self.config.is_encoder_decoder:
-                next_tokens, past_key_values, last_hidden_states, logit_for_next_step, selected_scores, decoder_hidden_states_one_step = EncDecContrastiveDecodingOneStepFast(
+                (
+                    next_tokens,
+                    past_key_values,
+                    last_hidden_states,
+                    logit_for_next_step,
+                    selected_scores,
+                    decoder_hidden_states_one_step,
+                ) = EncDecContrastiveDecodingOneStepFast(
                     self,
                     beam_width=top_k,
                     penalty_alpha=penalty_alpha,
                     last_hidden_states=last_hidden_states,
                     logit_for_next_step=logit_for_next_step,
-                    first_step=step == 0,
                     **model_inputs,
                 )
             else:
-                next_tokens, past_key_values, last_hidden_states, logit_for_next_step, selected_scores, decoder_hidden_states_one_step = ContrastiveDecodingOneStepFast(
+                (
+                    next_tokens,
+                    past_key_values,
+                    last_hidden_states,
+                    logit_for_next_step,
+                    selected_scores,
+                    decoder_hidden_states_one_step,
+                ) = ContrastiveDecodingOneStepFast(
                     self,
                     beam_width=top_k,
                     penalty_alpha=penalty_alpha,
                     last_hidden_states=last_hidden_states,
                     logit_for_next_step=logit_for_next_step,
-                    first_step=step == 0,
                     **model_inputs,
                 )
 
@@ -1855,15 +1875,11 @@ class GenerationMixin:
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
-                if output_attentions:
-                    decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
-                    )
-                    if self.config.is_encoder_decoder:
-                        cross_attentions += (outputs.cross_attentions,)
+                if output_scores:
+                    scores += (selected_scores,)
 
                 if output_hidden_states:
-                    decoder_hidden_states += (decoder_hidden_states_one_step)
+                    decoder_hidden_states += (decoder_hidden_states_one_step,)
 
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
@@ -1879,8 +1895,7 @@ class GenerationMixin:
                 )
             else:
                 outputs = CausalLMOutputWithCrossAttentions(
-                    past_key_values=past_key_values,
-                    attentions=model_kwargs['attention_mask']
+                    past_key_values=past_key_values, attentions=model_kwargs["attention_mask"]
                 )
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
@@ -1898,16 +1913,21 @@ class GenerationMixin:
                     this_peer_finished = True
 
             step += 1
+            # prepare model inputs
+            model_kwargs["past_key_values"] = past_key_values
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:
                 return ContrastiveSearchEncoderDecoderOutput(
                     sequences=input_ids,
+                    scores=scores,
                     decoder_hidden_states=decoder_hidden_states,
                 )
             else:
                 return ContrastiveSearchDecoderOnlyOutput(
                     sequences=input_ids,
+                    scores=scores,
                     hidden_states=decoder_hidden_states,
                 )
         else:
@@ -3729,216 +3749,99 @@ def top_k_top_p_filtering(
 
 # ========== utils for contrastive search decoding method ========= #
 def ranking_fast(
-    context_hidden: torch.FloatTensor, 
-    next_hidden: torch.FloatTensor, 
-    next_top_k_probs: torch.FloatTensor, 
-    alpha: float, 
-    beam_width: int
+    context_hidden: torch.FloatTensor,
+    next_hidden: torch.FloatTensor,
+    next_top_k_probs: torch.FloatTensor,
+    alpha: float,
+    beam_width: int,
 ) -> Tuple[torch.FloatTensor]:
-    '''
-        context_hidden: bsz*beam x seqlen x embed_dim
-        next_hidden: bsz*beam x 1 x embed_dim
-        next_top_k_probs: bsz x beam
-    '''
+    """
+    context_hidden: bsz*beam x seqlen x embed_dim next_hidden: bsz*beam x 1 x embed_dim next_top_k_probs: bsz x beam
+    """
     _, context_len, embed_dim = context_hidden.size()
     norm_context_hidden = context_hidden / context_hidden.norm(dim=2, keepdim=True)
     norm_next_hidden = next_hidden / next_hidden.norm(dim=2, keepdim=True)
-    cosine_matrix = torch.matmul(norm_context_hidden, norm_next_hidden.transpose(1,2)).squeeze(-1)    # [B*K, S]
-    scores, _ = torch.max(cosine_matrix, dim=-1)    # [B*K]
-    next_top_k_probs = next_top_k_probs.view(-1)    # [B*K]
-    scores = (1.0 - alpha) * next_top_k_probs - alpha * scores 
-    scores = torch.stack(torch.split(scores, beam_width))    # [B, K]
-    selected_scores, selected_idx = scores.max(dim=-1)    # [B]
+    cosine_matrix = torch.matmul(norm_context_hidden, norm_next_hidden.transpose(1, 2)).squeeze(-1)  # [B*K, S]
+    scores, _ = torch.max(cosine_matrix, dim=-1)  # [B*K]
+    next_top_k_probs = next_top_k_probs.view(-1)  # [B*K]
+    scores = (1.0 - alpha) * next_top_k_probs - alpha * scores
+    scores = torch.stack(torch.split(scores, beam_width))  # [B, K]
+    selected_scores, selected_idx = scores.max(dim=-1)  # [B]
     return selected_scores, selected_idx
 
+
 def ContrastiveDecodingOneStepFast(
-    model, 
-    beam_width: int = 1, 
-    penalty_alpha: float = 0., 
+    model,
+    beam_width: int = 1,
+    penalty_alpha: float = 0.0,
     past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
     last_hidden_states: torch.FloatTensor = None,
     logit_for_next_step: torch.FloatTensor = None,
     first_step: bool = False,
     **model_inputs,
 ) -> Tuple:
-    if first_step:
-        output = model(
-            **model_inputs,
-            past_key_values=past_key_values,
-            output_hidden_states=True
-        )
-        past_key_values = output.past_key_values
-        last_hidden_states = output.hidden_states[-1]    # [B, S, E]
-        logit_for_next_step = output.logits[:, -1, :]    # [B, V]
     bsz, seqlen, embed_dim = last_hidden_states.size()
-
     next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
-    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)    # [B, K]
-    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)    # [B, K]
+    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)  # [B, K]
+    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)  # [B, K]
     past_key_values = enlarge_past_key_values(past_key_values, beam_width)
 
     # build next attention mask
-    attention_mask = model_inputs['attention_mask']    # [B, S]
-    attention_mask = torch.cat([
-        attention_mask,
-        attention_mask.new_ones((bsz, 1))
-        ],
-        dim=-1
-    )
-    attention_mask = attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))    # [B*K, S+1]
+    attention_mask = model_inputs["attention_mask"]  # [B, S]
+    attention_mask = torch.cat([attention_mask, attention_mask.new_ones((bsz, 1))], dim=-1)
+    attention_mask = (
+        attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
+    )  # [B*K, S+1]
 
     next_model_inputs = {
-        'attention_mask': attention_mask,
-        'input_ids': top_k_ids.view(-1, 1),
-        'past_key_values': past_key_values,
-        'use_cache': True,
-        'output_hidden_states': True
+        "attention_mask": attention_mask,
+        "input_ids": top_k_ids.view(-1, 1),
+        "past_key_values": past_key_values,
+        "use_cache": True,
+        "output_hidden_states": True,
     }
     # OPT model does not containthe position_ids
-    if 'position_ids' in model_inputs:
-        position_ids = model_inputs['position_ids'][:, -1] + 1    # [B]
-        position_ids = position_ids.unsqueeze(dim=-1).expand(-1, beam_width)    # [B, K]
+    if "position_ids" in model_inputs:
+        position_ids = model_inputs["position_ids"][:, -1] + 1  # [B]
+        position_ids = position_ids.unsqueeze(dim=-1).expand(-1, beam_width)  # [B, K]
         position_ids = position_ids.reshape(-1, 1)
-        next_model_inputs['position_ids'] = position_ids
+        next_model_inputs["position_ids"] = position_ids
     output = model(**next_model_inputs)
     decoder_hidden_states = output.hidden_states
     past_key_values = output.past_key_values
-    logits = output.logits[:, -1, :]    # [B*K, V]
-    next_hidden = output.hidden_states[-1]    # [B*K, 1, E]
-    context_hidden = last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz*beam_width, seqlen, embed_dim)    # [B*K, S, E]
-
-    selected_scores, selected_idx = ranking_fast(
-        context_hidden, 
-        next_hidden, 
-        top_k_probs,    # [B, K] 
-        penalty_alpha,
-        beam_width,
-    )     # [B]
-    # prepare for the next step
-    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)    # [B, 1]
-    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))    # [B, K, E]
-    next_hidden = next_hidden[range(bsz), selected_idx, :]    # [B, E]
-    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)    # [B, S, E]
-
-    decoder_hidden_states = []
-    for layer in output.hidden_states:
-        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))    # [B, K, E]
-        layer = layer[range(bsz), selected_idx, :]    # [B, E]
-        decoder_hidden_states.append(layer)
-
-    past_key_values = select_past_key_values(past_key_values, beam_width, selected_idx)
-    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]    # [B, V]
-    return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
-
-def enlarge_past_key_values(
-    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
-    beam_width: int
-) -> Tuple[Tuple[torch.FloatTensor]]:
-    # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
-    new_key_values = []
-    for layer in past_key_values:
-        items = []
-        for item in layer:
-            # item is the key and value matrix
-            bsz, num_head, seq_len, esz = item.size()
-            item = item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz*beam_width, num_head, seq_len, esz)    # [bsz*beam, num_head, seq_len, esz]
-            items.append(item)
-        new_key_values.append(items)
-    return new_key_values
-
-def select_past_key_values(
-    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
-    beam_width: int, 
-    selected_idx: torch.FloatTensor
-) -> Tuple[Tuple[torch.FloatTensor]]:
-    '''select_idx: [B]'''
-    new_key_values = []
-    for layer in past_key_values:
-        items = []
-        for item in layer:
-            bsz_and_beam, num_head, seq_len, esz = item.size()
-            bsz = int(bsz_and_beam//beam_width)
-            item = torch.stack(torch.split(item, beam_width, dim=0))    # [B, K, num_head, seq_len, esz] 
-            item = item[range(bsz), selected_idx, :, :, :]   # [B, num_head, seq_len, esz]
-            items.append(item)
-        new_key_values.append(items)
-    return new_key_values
-
-## encoder-decoder contrastive utils function
-def EncDecContrastiveDecodingOneStepFast(
-    model,
-    beam_width: int = 1,
-    penalty_alpha: float = 0.,
-    past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
-    last_hidden_states: torch.FloatTensor = None,
-    logit_for_next_step: torch.FloatTensor = None,
-    first_step: bool = False,
-    **model_inputs,
-    ):
-    # input_ids: [B, S]
-    if first_step:
-        output = model(
-            **model_inputs,
-            past_key_values=past_key_values,
-            output_hidden_states=True,
-            output_attentions=True
-        )
-        past_key_values = output.past_key_values
-        last_hidden_states = output.decoder_hidden_states[-1]    # [B, S, E]
-        logit_for_next_step = output.logits[:, -1, :]    # [B, V]
-    bsz, seqlen, embed_dim = last_hidden_states.size()
-
-    next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
-    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)    # [B, K]
-    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)    # [B, K]
-    past_key_values = encdec_enlarge_past_key_values(past_key_values, beam_width)
-
-    # build next attention mask
-    attention_mask = model_inputs['attention_mask']    # [B, S]
-    attention_mask = attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))    # [B*K, S]
-
-    next_model_inputs = {
-        'encoder_outputs': model_inputs['encoder_outputs'],
-        'decoder_input_ids': top_k_ids.contiguous().view(-1, 1),
-        'past_key_values': past_key_values,
-        'use_cache': True,
-        'output_hidden_states': True,
-        'attention_mask': attention_mask
-    }
-
-    output = model(**next_model_inputs)
-    past_key_values = output.past_key_values
-    logits = output.logits[:, -1, :]    # [B*K, V]
-    next_hidden = output.decoder_hidden_states[-1]    # [B*K, 1, E]
-    context_hidden = last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz*beam_width, seqlen, embed_dim)    # [B*K, S, E]
+    logits = output.logits[:, -1, :]  # [B*K, V]
+    next_hidden = output.hidden_states[-1]  # [B*K, 1, E]
+    context_hidden = (
+        last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz * beam_width, seqlen, embed_dim)
+    )  # [B*K, S, E]
 
     selected_scores, selected_idx = ranking_fast(
         context_hidden,
         next_hidden,
-        top_k_probs,    # [B, K]
+        top_k_probs,  # [B, K]
         penalty_alpha,
         beam_width,
-    )     # [B]
+    )  # [B]
     # prepare for the next step
-    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)    # [B, 1]
-    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))    # [B, K, E]
-    next_hidden = next_hidden[range(bsz), selected_idx, :]    # [B, E]
-    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)    # [B, S, E]
+    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)  # [B, 1]
+    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))  # [B, K, E]
+    next_hidden = next_hidden[range(bsz), selected_idx, :]  # [B, E]
+    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)  # [B, S, E]
 
     decoder_hidden_states = []
-    for layer in output.decoder_hidden_states:
-        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))    # [B, K, E]
-        layer = layer[range(bsz), selected_idx, :]    # [B, E]
+    for layer in output.hidden_states:
+        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))  # [B, K, E]
+        layer = layer[range(bsz), selected_idx, :]  # [B, E]
         decoder_hidden_states.append(layer)
 
-    past_key_values = encdec_select_past_key_values(past_key_values, beam_width, selected_idx)
-    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]    # [B, V]
+    past_key_values = select_past_key_values(past_key_values, beam_width, selected_idx)
+    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]  # [B, V]
     return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
 
-def encdec_enlarge_past_key_values(
-    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
-    beam_width: int
-):
+
+def enlarge_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int
+) -> Tuple[Tuple[torch.FloatTensor]]:
     # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
     new_key_values = []
     for layer in past_key_values:
@@ -3946,25 +3849,122 @@ def encdec_enlarge_past_key_values(
         for item in layer:
             # item is the key and value matrix
             bsz, num_head, seq_len, esz = item.size()
-            item = item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz*beam_width, num_head, seq_len, esz)    # [bsz*beam, num_head, seq_len, esz]
+            item = (
+                item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz * beam_width, num_head, seq_len, esz)
+            )  # [bsz*beam, num_head, seq_len, esz]
             items.append(item)
-        new_key_values.append(tuple(items))
-    return tuple(new_key_values)
+        new_key_values.append(items)
+    return new_key_values
 
-def encdec_select_past_key_values(
-    past_key_values: Tuple[Tuple[torch.FloatTensor]], 
-    beam_width: int, 
-    selected_idx: torch.FloatTensor
-):
-    '''select_idx: [B]'''
+
+def select_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int, selected_idx: torch.FloatTensor
+) -> Tuple[Tuple[torch.FloatTensor]]:
+    """select_idx: [B]"""
     new_key_values = []
     for layer in past_key_values:
         items = []
         for item in layer:
             bsz_and_beam, num_head, seq_len, esz = item.size()
-            bsz = int(bsz_and_beam//beam_width)
-            item = torch.stack(torch.split(item, beam_width, dim=0)).contiguous()    # [B, K, num_head, seq_len, esz]
-            item = item[range(bsz), selected_idx, :, :, :]   # [B, num_head, seq_len, esz]
+            bsz = int(bsz_and_beam // beam_width)
+            item = torch.stack(torch.split(item, beam_width, dim=0))  # [B, K, num_head, seq_len, esz]
+            item = item[range(bsz), selected_idx, :, :, :]  # [B, num_head, seq_len, esz]
+            items.append(item)
+        new_key_values.append(items)
+    return new_key_values
+
+
+# encoder-decoder contrastive utils function
+def EncDecContrastiveDecodingOneStepFast(
+    model,
+    beam_width: int = 1,
+    penalty_alpha: float = 0.0,
+    past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
+    last_hidden_states: torch.FloatTensor = None,
+    logit_for_next_step: torch.FloatTensor = None,
+    **model_inputs,
+):
+    bsz, seqlen, embed_dim = last_hidden_states.size()
+    next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
+    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)  # [B, K]
+    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)  # [B, K]
+    past_key_values = encdec_enlarge_past_key_values(past_key_values, beam_width)
+
+    # build next attention mask
+    attention_mask = model_inputs["attention_mask"]  # [B, S]
+    attention_mask = (
+        attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
+    )  # [B*K, S]
+
+    next_model_inputs = {
+        "encoder_outputs": model_inputs["encoder_outputs"],
+        "decoder_input_ids": top_k_ids.contiguous().view(-1, 1),
+        "past_key_values": past_key_values,
+        "use_cache": True,
+        "output_hidden_states": True,
+        "attention_mask": attention_mask,
+    }
+
+    output = model(**next_model_inputs)
+    past_key_values = output.past_key_values
+    logits = output.logits[:, -1, :]  # [B*K, V]
+    next_hidden = output.decoder_hidden_states[-1]  # [B*K, 1, E]
+    context_hidden = (
+        last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz * beam_width, seqlen, embed_dim)
+    )  # [B*K, S, E]
+
+    selected_scores, selected_idx = ranking_fast(
+        context_hidden,
+        next_hidden,
+        top_k_probs,  # [B, K]
+        penalty_alpha,
+        beam_width,
+    )  # [B]
+    # prepare for the next step
+    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)  # [B, 1]
+    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))  # [B, K, E]
+    next_hidden = next_hidden[range(bsz), selected_idx, :]  # [B, E]
+    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)  # [B, S, E]
+
+    decoder_hidden_states = []
+    for layer in output.decoder_hidden_states:
+        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))  # [B, K, E]
+        layer = layer[range(bsz), selected_idx, :]  # [B, E]
+        decoder_hidden_states.append(layer)
+
+    past_key_values = encdec_select_past_key_values(past_key_values, beam_width, selected_idx)
+    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]  # [B, V]
+    return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
+
+
+def encdec_enlarge_past_key_values(past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int):
+    # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
+    new_key_values = []
+    for layer in past_key_values:
+        items = []
+        for item in layer:
+            # item is the key and value matrix
+            bsz, num_head, seq_len, esz = item.size()
+            item = (
+                item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz * beam_width, num_head, seq_len, esz)
+            )  # [bsz*beam, num_head, seq_len, esz]
+            items.append(item)
+        new_key_values.append(tuple(items))
+    return tuple(new_key_values)
+
+
+def encdec_select_past_key_values(
+    past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int, selected_idx: torch.FloatTensor
+):
+    """select_idx: [B]"""
+    new_key_values = []
+    for layer in past_key_values:
+        items = []
+        for item in layer:
+            bsz_and_beam, num_head, seq_len, esz = item.size()
+            bsz = int(bsz_and_beam // beam_width)
+            item = torch.stack(torch.split(item, beam_width, dim=0)).contiguous()  # [B, K, num_head, seq_len, esz]
+            item = item[range(bsz), selected_idx, :, :, :]  # [B, num_head, seq_len, esz]
             items.append(item)
         new_key_values.append(items)
     return new_key_values
