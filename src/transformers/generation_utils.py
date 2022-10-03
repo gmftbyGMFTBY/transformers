@@ -1224,6 +1224,7 @@ class GenerationMixin:
         # 1. Set generation parameters if not already defined
         bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
         num_beams = num_beams if num_beams is not None else self.config.num_beams
+        top_k = top_k if top_k is not None else self.config.top_k
         length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
         early_stopping = early_stopping if early_stopping is not None else self.config.early_stopping
         num_beam_groups = num_beam_groups if num_beam_groups is not None else self.config.num_beam_groups
@@ -1344,7 +1345,7 @@ class GenerationMixin:
         # 6. determine generation mode
         is_constraint_gen_mode = constraints is not None or force_words_ids is not None
         is_contrastive_search_gen_mode = (
-            top_k > 1 and do_sample is False and penalty_alpha is not None and penalty_alpha > 0
+            top_k is not None and top_k > 1 and do_sample is False and penalty_alpha is not None and penalty_alpha > 0
         )
         is_greedy_gen_mode = (
             (num_beams == 1)
@@ -1690,6 +1691,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
+    @torch.no_grad()
     def contrastive_search(
         self,
         input_ids: torch.LongTensor,
@@ -1817,10 +1819,18 @@ class GenerationMixin:
         model_kwargs["use_cache"] = True
         model_kwargs["past_key_values"] = None
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        if self.config.is_encoder_decoder:
+            model_inputs["input_ids"] = input_ids
         output = self(**model_inputs, output_hidden_states=True, output_attentions=True)
         past_key_values = output.past_key_values
         if self.config.is_encoder_decoder:
             last_hidden_states = output.decoder_hidden_states[-1]  # [B, S, E]
+            encoder_outputs = (
+                output.encoder_last_hidden_state,
+                output.encoder_hidden_states,
+                output.encoder_attentions,
+            )
+            model_inputs["encoder_outputs"] = encoder_outputs
         else:
             last_hidden_states = output.hidden_states[-1]  # [B, S, E]
         logit_for_next_step = output.logits[:, -1, :]  # [B, V]
