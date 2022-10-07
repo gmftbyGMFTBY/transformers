@@ -444,8 +444,7 @@ class ConvBertModelIntegrationTest(unittest.TestCase):
     def test_inference_no_head(self):
         model = ConvBertModel.from_pretrained("YituTech/conv-bert-base")
         input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
-        with torch.no_grad():
-            output = model(input_ids)[0]
+        output = model(input_ids)[0]
 
         expected_shape = torch.Size((1, 6, 768))
         self.assertEqual(output.shape, expected_shape)

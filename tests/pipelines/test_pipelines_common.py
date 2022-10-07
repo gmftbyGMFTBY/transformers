@@ -37,6 +37,8 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DistilBertForSequenceClassification,
+    IBertConfig,
+    RobertaConfig,
     TextClassificationPipeline,
     TFAutoModelForSequenceClassification,
     pipeline,
@@ -67,16 +69,6 @@ from test_module.custom_pipeline import PairClassificationPipeline  # noqa E402
 
 
 logger = logging.getLogger(__name__)
-
-
-ROBERTA_EMBEDDING_ADJUSMENT_CONFIGS = [
-    "CamembertConfig",
-    "IBertConfig",
-    "LongformerConfig",
-    "MarkupLMConfig",
-    "RobertaConfig",
-    "XLMRobertaConfig",
-]
 
 
 def get_checkpoint_from_architecture(architecture):
@@ -202,7 +194,7 @@ class PipelineTestCaseMeta(type):
                     try:
                         tokenizer = get_tiny_tokenizer_from_checkpoint(checkpoint)
                         # XLNet actually defines it as -1.
-                        if model.config.__class__.__name__ in ROBERTA_EMBEDDING_ADJUSMENT_CONFIGS:
+                        if isinstance(model.config, (RobertaConfig, IBertConfig)):
                             tokenizer.model_max_length = model.config.max_position_embeddings - 2
                         elif (
                             hasattr(model.config, "max_position_embeddings")

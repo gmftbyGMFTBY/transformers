@@ -19,7 +19,6 @@ import random
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
-import numpy as np
 import tensorflow as tf
 
 from ...activations_tf import get_tf_activation
@@ -27,7 +26,6 @@ from ...modeling_tf_outputs import TFBaseModelOutputWithPastAndCrossAttentions
 
 # Public API
 from ...modeling_tf_utils import (
-    TFModelInputType,
     TFPreTrainedModel,
     TFSharedEmbeddings,
     TFWrappedEmbeddings,
@@ -2392,23 +2390,23 @@ class TFLEDForConditionalGeneration(TFLEDPreTrainedModel):
     @replace_return_docstrings(output_type=TFLEDSeq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
         encoder_outputs: Optional[TFLEDEncoderBaseModelOutput] = None,
-        global_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        labels: Optional[tf.Tensor] = None,
-        training: bool = False,
+        global_attention_mask=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        decoder_inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        labels=None,
+        training=False,
     ):
         """
         Returns:

@@ -33,9 +33,7 @@
     - local: converting_tensorflow_models
       title: Converting from TensorFlow checkpoints
     - local: serialization
-      title: Export to ONNX
-    - local: torchscript
-      title: Export to TorchScript
+      title: Export 🤗 Transformers models
     - local: troubleshooting
       title: Troubleshoot
     title: General usage
@@ -449,8 +447,6 @@
         title: Wav2Vec2Phoneme
       - local: model_doc/wavlm
         title: WavLM
-      - local: model_doc/whisper
-        title: Whisper
       - local: model_doc/xls_r
         title: XLS-R
       - local: model_doc/xlsr_wav2vec2

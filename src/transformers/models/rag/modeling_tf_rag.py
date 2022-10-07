@@ -16,19 +16,13 @@
 """TFRAG model implementation."""
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
 
 from ...configuration_utils import PretrainedConfig
-from ...modeling_tf_utils import (
-    TFCausalLanguageModelingLoss,
-    TFModelInputType,
-    TFPreTrainedModel,
-    shape_list,
-    unpack_inputs,
-)
+from ...modeling_tf_utils import TFCausalLanguageModelingLoss, TFPreTrainedModel, shape_list, unpack_inputs
 from ...utils import ModelOutput, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_rag import RagConfig
 from .retrieval_rag import RagRetriever
@@ -497,7 +491,7 @@ class TFRagModel(TFRagPreTrainedModel):
         config: Optional[PretrainedConfig] = None,
         question_encoder: Optional[TFPreTrainedModel] = None,
         generator: Optional[TFPreTrainedModel] = None,
-        retriever: Optional[RagRetriever] = None,
+        retriever: Optional = None,
         load_weight_prefix: Optional[str] = None,
         **kwargs,
     ):
@@ -544,22 +538,22 @@ class TFRagModel(TFRagPreTrainedModel):
     @replace_return_docstrings(output_type=TFRetrievAugLMOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_outputs: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        doc_scores: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        context_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        context_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_retrieved: Optional[bool] = None,
-        n_docs: Optional[int] = None,
-        return_dict: Optional[bool] = None,
-        training: bool = False,
+        input_ids=None,
+        attention_mask=None,
+        encoder_outputs=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        past_key_values=None,
+        doc_scores=None,
+        context_input_ids=None,
+        context_attention_mask=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        output_retrieved=None,
+        n_docs=None,
+        return_dict=None,
+        training=False,
         **kwargs
     ):
         r"""
@@ -732,7 +726,7 @@ class TFRagTokenForGeneration(TFRagPreTrainedModel, TFCausalLanguageModelingLoss
         config: Optional[PretrainedConfig] = None,
         question_encoder: Optional[TFPreTrainedModel] = None,
         generator: Optional[TFPreTrainedModel] = None,
-        retriever: Optional[RagRetriever] = None,
+        retriever: Optional = None,
         **kwargs,
     ):
         assert config is not None or (
@@ -834,25 +828,25 @@ class TFRagTokenForGeneration(TFRagPreTrainedModel, TFCausalLanguageModelingLoss
     @replace_return_docstrings(output_type=TFRetrievAugLMMarginOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_outputs: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        doc_scores: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        context_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        context_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_retrieved: Optional[bool] = None,
-        n_docs: Optional[int] = None,
-        do_marginalize: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        reduce_loss: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        training: bool = False,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        encoder_outputs=None,
+        past_key_values=None,
+        doc_scores=None,
+        context_input_ids=None,
+        context_attention_mask=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        output_retrieved=None,
+        n_docs=None,
+        do_marginalize=None,
+        labels=None,
+        reduce_loss=None,
+        return_dict=None,
+        training=False,
         **kwargs  # needs kwargs for generation
     ):
         r"""
@@ -986,7 +980,7 @@ class TFRagTokenForGeneration(TFRagPreTrainedModel, TFCausalLanguageModelingLoss
 
     def generate(
         self,
-        input_ids: Optional[TFModelInputType] = None,
+        input_ids: Optional[tf.Tensor] = None,
         attention_mask: Optional[tf.Tensor] = None,
         context_input_ids=None,
         context_attention_mask=None,
@@ -1387,7 +1381,7 @@ class TFRagSequenceForGeneration(TFRagPreTrainedModel, TFCausalLanguageModelingL
         config: Optional[PretrainedConfig] = None,
         question_encoder: Optional[TFPreTrainedModel] = None,
         generator: Optional[TFPreTrainedModel] = None,
-        retriever: Optional[RagRetriever] = None,
+        retriever: Optional = None,
         **kwargs,
     ):
         assert config is not None or (
@@ -1431,27 +1425,27 @@ class TFRagSequenceForGeneration(TFRagPreTrainedModel, TFCausalLanguageModelingL
     @replace_return_docstrings(output_type=TFRetrievAugLMMarginOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        decoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_outputs: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        doc_scores: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        context_input_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        context_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_retrieved: Optional[bool] = None,
-        n_docs: Optional[int] = None,
-        exclude_bos_score: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        reduce_loss: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        training: bool = False,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        encoder_outputs=None,
+        past_key_values=None,
+        doc_scores=None,
+        context_input_ids=None,
+        context_attention_mask=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        output_retrieved=None,
+        n_docs=None,
+        exclude_bos_score=None,
+        labels=None,
+        reduce_loss=None,
+        return_dict=None,
+        training=False,
         **kwargs  # needs kwargs for generation
-    ) -> Union[Tuple[tf.Tensor], TFRetrievAugLMMarginOutput]:
+    ):
         r"""
         exclude_bos_score (`bool`, *optional*):
             Only relevant if `labels` is passed. If `True`, the score of the BOS token is disregarded when computing
@@ -1663,7 +1657,7 @@ class TFRagSequenceForGeneration(TFRagPreTrainedModel, TFCausalLanguageModelingL
 
     def generate(
         self,
-        input_ids: Optional[TFModelInputType] = None,
+        input_ids: Optional[tf.Tensor] = None,
         attention_mask: Optional[tf.Tensor] = None,
         context_input_ids=None,
         context_attention_mask=None,

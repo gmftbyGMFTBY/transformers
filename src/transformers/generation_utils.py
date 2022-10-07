@@ -30,7 +30,6 @@ from .generation_logits_process import (
     ExponentialDecayLengthPenalty,
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
-    ForceTokensLogitsProcessor,
     HammingDiversityLogitsProcessor,
     InfNanRemoveLogitsProcessor,
     LogitNormalization,
@@ -40,8 +39,6 @@ from .generation_logits_process import (
     NoRepeatNGramLogitsProcessor,
     PrefixConstrainedLogitsProcessor,
     RepetitionPenaltyLogitsProcessor,
-    SuppressTokensAtBeginLogitsProcessor,
-    SuppressTokensLogitsProcessor,
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
@@ -741,9 +738,6 @@ class GenerationMixin:
         exponential_decay_length_penalty: Tuple,
         logits_processor: Optional[LogitsProcessorList],
         renormalize_logits: Optional[bool],
-        suppress_tokens: Optional[List[int]] = None,
-        begin_suppress_tokens: Optional[List[int]] = None,
-        forced_decoder_ids: Optional[List[int]] = None,
     ) -> LogitsProcessorList:
         """
         This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
@@ -778,12 +772,6 @@ class GenerationMixin:
             if exponential_decay_length_penalty is not None
             else self.config.exponential_decay_length_penalty
         )
-        suppress_tokens = suppress_tokens if suppress_tokens is not None else self.config.suppress_tokens
-        begin_suppress_tokens = (
-            begin_suppress_tokens if begin_suppress_tokens is not None else self.config.begin_suppress_tokens
-        )
-        if forced_decoder_ids is None and hasattr(self.config, "forced_decoder_ids"):
-            forced_decoder_ids = self.config.forced_decoder_ids
         # instantiate processors list
 
         # the following idea is largely copied from this PR: https://github.com/huggingface/transformers/pull/5420/files
@@ -821,16 +809,6 @@ class GenerationMixin:
             processors.append(
                 ExponentialDecayLengthPenalty(exponential_decay_length_penalty, eos_token_id, input_ids_seq_length)
             )
-        if suppress_tokens is not None:
-            processors.append(SuppressTokensLogitsProcessor(suppress_tokens))
-        if begin_suppress_tokens is not None:
-            begin_index = input_ids_seq_length
-            begin_index = begin_index if (input_ids_seq_length > 1 or forced_bos_token_id is None) else begin_index + 1
-            if forced_decoder_ids is not None:
-                begin_index += forced_decoder_ids[-1][0]  # generation starts after the last token that is forced
-            processors.append(SuppressTokensAtBeginLogitsProcessor(begin_suppress_tokens, begin_index))
-        if forced_decoder_ids is not None:
-            processors.append(ForceTokensLogitsProcessor(forced_decoder_ids))
         processors = self._merge_criteria_processor_list(processors, logits_processor)
         # `LogitNormalization` should always be the last logit processor, when present
         if renormalize_logits is True:
@@ -1002,9 +980,6 @@ class GenerationMixin:
         remove_invalid_values: Optional[bool] = None,
         synced_gpus: Optional[bool] = False,
         exponential_decay_length_penalty: Optional[Tuple[Union[int, float]]] = None,
-        suppress_tokens: Optional[List[int]] = None,
-        begin_suppress_tokens: Optional[List[int]] = None,
-        forced_decoder_ids: Optional[List[int]] = None,
         **model_kwargs,
     ) -> Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, torch.LongTensor]:
         r"""
@@ -1163,14 +1138,6 @@ class GenerationMixin:
                 This Tuple adds an exponentially increasing length penalty, after a certain amount of tokens have been
                 generated. The tuple shall consist of: `(start_index, decay_factor)` where `start_index` indicates
                 where penalty starts and `decay_factor` represents the factor of exponential decay
-            suppress_tokens  (`List[int]`, *optional*, defaults to `model.config.suppress_tokens`):
-                A list of tokens that will be supressed at generation. The `SupressTokens` logit processor will set
-                their log probs to `-inf` so that they are not sampled.
-            begin_suppress_tokens  (`List[int]`, *optional*, defaults to `model.config.begin_suppress_tokens`):
-                A list of tokens that will be supressed at the begining of the generation. The `SupressBeginTokens`
-                logit processor will set their log probs to `-inf` so that they are not sampled.
-            forced_decoder_ids (`List[int]`, *optional*, defaults to `model.config.forced_decoder_ids`):
-                A list of tokens that will be forced as beginning tokens, before sampling.
 
             model_kwargs:
                 Additional model specific kwargs will be forwarded to the `forward` function of the model. If the model
@@ -1443,9 +1410,6 @@ class GenerationMixin:
             exponential_decay_length_penalty=exponential_decay_length_penalty,
             logits_processor=logits_processor,
             renormalize_logits=renormalize_logits,
-            suppress_tokens=suppress_tokens,
-            begin_suppress_tokens=begin_suppress_tokens,
-            forced_decoder_ids=forced_decoder_ids,
         )
 
         # 8. prepare stopping criteria
@@ -1850,27 +1814,23 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
 
-        # encode the prefix first and prepare model inputs
-        step = 0
+        # encode the given prefix and prepare model inputs; encoder-decoder model process the prefix and save the `encoder_outputs`
         model_kwargs["use_cache"] = True
         model_kwargs["past_key_values"] = None
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-        if self.config.is_encoder_decoder:
-            model_inputs["input_ids"] = input_ids
         output = self(**model_inputs, output_hidden_states=True, output_attentions=True)
+
+        # past_key_values is activated for fast decoding
         past_key_values = output.past_key_values
-        if self.config.is_encoder_decoder:
-            last_hidden_states = output.decoder_hidden_states[-1]  # [B, S, E]
-            encoder_outputs = (
-                output.encoder_last_hidden_state,
-                output.encoder_hidden_states,
-                output.encoder_attentions,
-            )
-            model_inputs["encoder_outputs"] = encoder_outputs
-        else:
-            last_hidden_states = output.hidden_states[-1]  # [B, S, E]
-        logit_for_next_step = output.logits[:, -1, :]  # [B, V]
         model_inputs["past_key_values"] = past_key_values
+        
+        # last decoder hidden states will be used to compute the degeneration penalty (cosine similarity with previous tokens)
+        if self.config.is_encoder_decoder:
+            last_hidden_states = output.decoder_hidden_states[-1]
+        else:
+            last_hidden_states = output.hidden_states[-1]
+        # next logit for contrastive search to select top-k candidate tokens
+        logit_for_next_step = output.logits[:, -1, :]
 
         while True:
             if synced_gpus:
@@ -1883,6 +1843,7 @@ class GenerationMixin:
                 if this_peer_finished_flag.item() == 0.0:
                     break
 
+            # contrastive search decoding consists of two steps: (1) candidate tokens recall; (2) candidate re-rank by degeneration penalty
             if self.config.is_encoder_decoder:
                 (
                     next_tokens,
@@ -1958,7 +1919,6 @@ class GenerationMixin:
                 else:
                     this_peer_finished = True
 
-            step += 1
             # prepare model inputs
             model_kwargs["past_key_values"] = past_key_values
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3823,7 +3783,6 @@ def ContrastiveDecodingOneStepFast(
     past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
     last_hidden_states: torch.FloatTensor = None,
     logit_for_next_step: torch.FloatTensor = None,
-    first_step: bool = False,
     **model_inputs,
 ) -> Tuple:
     bsz, seqlen, embed_dim = last_hidden_states.size()
@@ -3853,7 +3812,6 @@ def ContrastiveDecodingOneStepFast(
         position_ids = position_ids.reshape(-1, 1)
         next_model_inputs["position_ids"] = position_ids
     output = model(**next_model_inputs)
-    decoder_hidden_states = output.hidden_states
     past_key_values = output.past_key_values
     logits = output.logits[:, -1, :]  # [B*K, V]
     next_hidden = output.hidden_states[-1]  # [B*K, 1, E]
@@ -3934,9 +3892,9 @@ def EncDecContrastiveDecodingOneStepFast(
     next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
     _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)  # [B, K]
     top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)  # [B, K]
-    past_key_values = encdec_enlarge_past_key_values(past_key_values, beam_width)
+    past_key_values = enlarge_past_key_values(past_key_values, beam_width)
 
-    # build next attention mask
+    # encoder attention mask
     attention_mask = model_inputs["attention_mask"]  # [B, S]
     attention_mask = (
         attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
@@ -3978,39 +3936,7 @@ def EncDecContrastiveDecodingOneStepFast(
         layer = layer[range(bsz), selected_idx, :]  # [B, E]
         decoder_hidden_states.append(layer)
 
-    past_key_values = encdec_select_past_key_values(past_key_values, beam_width, selected_idx)
+    past_key_values = select_past_key_values(past_key_values, beam_width, selected_idx)
     logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]  # [B, V]
     return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
 
-
-def encdec_enlarge_past_key_values(past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int):
-    # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
-    new_key_values = []
-    for layer in past_key_values:
-        items = []
-        for item in layer:
-            # item is the key and value matrix
-            bsz, num_head, seq_len, esz = item.size()
-            item = (
-                item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz * beam_width, num_head, seq_len, esz)
-            )  # [bsz*beam, num_head, seq_len, esz]
-            items.append(item)
-        new_key_values.append(tuple(items))
-    return tuple(new_key_values)
-
-
-def encdec_select_past_key_values(
-    past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int, selected_idx: torch.FloatTensor
-):
-    """select_idx: [B]"""
-    new_key_values = []
-    for layer in past_key_values:
-        items = []
-        for item in layer:
-            bsz_and_beam, num_head, seq_len, esz = item.size()
-            bsz = int(bsz_and_beam // beam_width)
-            item = torch.stack(torch.split(item, beam_width, dim=0)).contiguous()  # [B, K, num_head, seq_len, esz]
-            item = item[range(bsz), selected_idx, :, :, :]  # [B, num_head, seq_len, esz]
-            items.append(item)
-        new_key_values.append(items)
-    return new_key_values

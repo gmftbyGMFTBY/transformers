@@ -627,8 +627,7 @@ class BigBirdModelIntegrationTest(unittest.TestCase):
         model.to(torch_device)
 
         input_ids = torch.tensor([[20920, 232, 328, 1437] * 1024], dtype=torch.long, device=torch_device)
-        with torch.no_grad():
-            outputs = model(input_ids)
+        outputs = model(input_ids)
         prediction_logits = outputs.prediction_logits
         seq_relationship_logits = outputs.seq_relationship_logits
 
@@ -656,8 +655,7 @@ class BigBirdModelIntegrationTest(unittest.TestCase):
         model.to(torch_device)
 
         input_ids = torch.tensor([[20920, 232, 328, 1437] * 512], dtype=torch.long, device=torch_device)
-        with torch.no_grad():
-            outputs = model(input_ids)
+        outputs = model(input_ids)
         prediction_logits = outputs.prediction_logits
         seq_relationship_logits = outputs.seq_relationship_logits
 
@@ -922,8 +920,7 @@ class BigBirdModelIntegrationTest(unittest.TestCase):
         model.eval()
 
         input_ids = torch.tensor([200 * [10] + 40 * [2] + [1]], device=torch_device, dtype=torch.long)
-        with torch.no_grad():
-            output = model(input_ids).to_tuple()[0]
+        output = model(input_ids).to_tuple()[0]
 
         # fmt: off
         target = torch.tensor(
