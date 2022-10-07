@@ -1006,6 +1006,13 @@ class BloomForCausalLM(metaclass=DummyObject):
         requires_backends(self, ["torch"])
 
 
+class BloomForQuestionAnswering(metaclass=DummyObject):
+    _backends = ["torch"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+
 class BloomForSequenceClassification(metaclass=DummyObject):
     _backends = ["torch"]
 
@@ -1080,6 +1087,13 @@ class CamembertForTokenClassification(metaclass=DummyObject):
 
 
 class CamembertModel(metaclass=DummyObject):
+    _backends = ["torch"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+
+class CamembertPreTrainedModel(metaclass=DummyObject):
     _backends = ["torch"]
 
     def __init__(self, *args, **kwargs):
@@ -5424,6 +5438,30 @@ class WavLMModel(metaclass=DummyObject):
 
 
 class WavLMPreTrainedModel(metaclass=DummyObject):
+    _backends = ["torch"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+
+WHISPER_PRETRAINED_MODEL_ARCHIVE_LIST = None
+
+
+class WhisperForConditionalGeneration(metaclass=DummyObject):
+    _backends = ["torch"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+
+class WhisperModel(metaclass=DummyObject):
+    _backends = ["torch"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["torch"])
+
+
+class WhisperPreTrainedModel(metaclass=DummyObject):
     _backends = ["torch"]
 
     def __init__(self, *args, **kwargs):
