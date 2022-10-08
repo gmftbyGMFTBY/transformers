@@ -1823,7 +1823,7 @@ class GenerationMixin:
         # past_key_values is activated for fast decoding
         past_key_values = output.past_key_values
         model_inputs["past_key_values"] = past_key_values
-        
+
         # last decoder hidden states will be used to compute the degeneration penalty (cosine similarity with previous tokens)
         if self.config.is_encoder_decoder:
             last_hidden_states = output.decoder_hidden_states[-1]
@@ -1844,38 +1844,22 @@ class GenerationMixin:
                     break
 
             # contrastive search decoding consists of two steps: (1) candidate tokens recall; (2) candidate re-rank by degeneration penalty
-            if self.config.is_encoder_decoder:
-                (
-                    next_tokens,
-                    past_key_values,
-                    last_hidden_states,
-                    logit_for_next_step,
-                    selected_scores,
-                    decoder_hidden_states_one_step,
-                ) = EncDecContrastiveDecodingOneStepFast(
-                    self,
-                    beam_width=top_k,
-                    penalty_alpha=penalty_alpha,
-                    last_hidden_states=last_hidden_states,
-                    logit_for_next_step=logit_for_next_step,
-                    **model_inputs,
-                )
-            else:
-                (
-                    next_tokens,
-                    past_key_values,
-                    last_hidden_states,
-                    logit_for_next_step,
-                    selected_scores,
-                    decoder_hidden_states_one_step,
-                ) = ContrastiveDecodingOneStepFast(
-                    self,
-                    beam_width=top_k,
-                    penalty_alpha=penalty_alpha,
-                    last_hidden_states=last_hidden_states,
-                    logit_for_next_step=logit_for_next_step,
-                    **model_inputs,
-                )
+            (
+                next_tokens,
+                past_key_values,
+                last_hidden_states,
+                logit_for_next_step,
+                selected_scores,
+                decoder_hidden_states_one_step,
+            ) = ContrastiveDecodingOneStepFast(
+                self,
+                beam_width=top_k,
+                penalty_alpha=penalty_alpha,
+                last_hidden_states=last_hidden_states,
+                logit_for_next_step=logit_for_next_step,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_inputs,
+            )
 
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
@@ -3783,75 +3767,101 @@ def ContrastiveDecodingOneStepFast(
     past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
     last_hidden_states: torch.FloatTensor = None,
     logit_for_next_step: torch.FloatTensor = None,
+    is_encoder_decoder: bool = False,
     **model_inputs,
 ) -> Tuple:
+    """
+    contrastive search first selects top-k candidates by the logit scores; then these candidate tokens are fed into the
+    language models to compute the degeneration penalty, which will be used to re-rank these candidate tokens.
+    """
     bsz, seqlen, embed_dim = last_hidden_states.size()
     next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
-    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)  # [B, K]
-    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)  # [B, K]
+    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)
+    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)
     past_key_values = enlarge_past_key_values(past_key_values, beam_width)
 
     # build next attention mask
     attention_mask = model_inputs["attention_mask"]  # [B, S]
-    attention_mask = torch.cat([attention_mask, attention_mask.new_ones((bsz, 1))], dim=-1)
-    attention_mask = (
-        attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
-    )  # [B*K, S+1]
+    # decoder-only model need the full attention mask, not only the mask for the last token
+    if is_encoder_decoder is False:
+        attention_mask = torch.cat([attention_mask, attention_mask.new_ones((bsz, 1))], dim=-1)
+    attention_mask = attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
 
-    next_model_inputs = {
-        "attention_mask": attention_mask,
-        "input_ids": top_k_ids.view(-1, 1),
-        "past_key_values": past_key_values,
-        "use_cache": True,
-        "output_hidden_states": True,
-    }
-    # OPT model does not containthe position_ids
+    # OPT model does not contain the position_ids
     if "position_ids" in model_inputs:
-        position_ids = model_inputs["position_ids"][:, -1] + 1  # [B]
-        position_ids = position_ids.unsqueeze(dim=-1).expand(-1, beam_width)  # [B, K]
+        position_ids = model_inputs["position_ids"][:, -1] + 1
+        position_ids = position_ids.unsqueeze(dim=-1).expand(-1, beam_width)
         position_ids = position_ids.reshape(-1, 1)
-        next_model_inputs["position_ids"] = position_ids
-    output = model(**next_model_inputs)
+    else:
+        position_ids = None
+    # encoder-decoder model also contains the `encoder_outputs`
+    if is_encoder_decoder and "encoder_outputs" in model_inputs:
+        encoder_outputs = model_inputs["encoder_outputs"]
+    else:
+        encoder_outputs = None
+    next_model_inputs = model.prepare_inputs_for_generation(
+        top_k_ids.view(-1, 1),
+        past=past_key_values,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=True,
+        encoder_outputs=encoder_outputs,
+    )
+    # compute the candidate tokens by the language model and collects their hidden_states
+    output = model(output_hidden_states=True, **next_model_inputs)
     past_key_values = output.past_key_values
-    logits = output.logits[:, -1, :]  # [B*K, V]
-    next_hidden = output.hidden_states[-1]  # [B*K, 1, E]
+    logits = output.logits[:, -1, :]
+    # name is different for encoder-decoder and decoder-only models
+    if is_encoder_decoder:
+        next_hidden = output.decoder_hidden_states[-1]
+        full_hidden_states = output.decoder_hidden_states
+    else:
+        next_hidden = output.hidden_states[-1]
+        full_hidden_states = output.hidden_states
     context_hidden = (
         last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz * beam_width, seqlen, embed_dim)
-    )  # [B*K, S, E]
+    )
 
+    # compute the degeneratin penalty and re-rank the candidates based on the degeneration penalty and the model confidence
+    # the scores and index of the selected tokens are returned
     selected_scores, selected_idx = ranking_fast(
         context_hidden,
         next_hidden,
-        top_k_probs,  # [B, K]
+        top_k_probs,
         penalty_alpha,
         beam_width,
-    )  # [B]
-    # prepare for the next step
-    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)  # [B, 1]
-    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))  # [B, K, E]
-    next_hidden = next_hidden[range(bsz), selected_idx, :]  # [B, E]
-    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)  # [B, S, E]
+    )
+    # prepare for the next step: (1) next token_id; (2) past_key_values; (3) last_hidden_states for computing the degeneration penalty; (4) logits for selecting next top-k candidates; (5) selected tokens scores (model confidence minus degeneration penalty); (6) decoder hidden_states
+    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)
+    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))
+    next_hidden = next_hidden[range(bsz), selected_idx, :]
+    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)
 
     decoder_hidden_states = []
-    for layer in output.hidden_states:
-        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))  # [B, K, E]
-        layer = layer[range(bsz), selected_idx, :]  # [B, E]
+    for layer in full_hidden_states:
+        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))
+        layer = layer[range(bsz), selected_idx, :]
         decoder_hidden_states.append(layer)
 
     past_key_values = select_past_key_values(past_key_values, beam_width, selected_idx)
-    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]  # [B, V]
+    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]
     return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
 
 
 def enlarge_past_key_values(
     past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int
 ) -> Tuple[Tuple[torch.FloatTensor]]:
+    """
+    Copy and extend the past_key_values for the next step re-rank each item in `past_key_values` is the 4-dimension
+    matrix, whose shapre is [batch_size, num_head, seq_len, embed_dim] Suppose the size of the next token candidate
+    size is K, we need to obtain the new `past_key_values`, whose shape is [batch_size*K, num_head, seq_len, embed_dim]
+    """
     # from [B, num_head, seq_len, esz] to [B*K, num_head, seq_len, esz]
     new_key_values = []
     for layer in past_key_values:
         items = []
+        # item is either the key or the value matrix
         for item in layer:
-            # item is the key and value matrix
             bsz, num_head, seq_len, esz = item.size()
             item = (
                 item.unsqueeze(1).expand(-1, beam_width, -1, -1, -1).reshape(bsz * beam_width, num_head, seq_len, esz)
@@ -3864,10 +3874,16 @@ def enlarge_past_key_values(
 def select_past_key_values(
     past_key_values: Tuple[Tuple[torch.FloatTensor]], beam_width: int, selected_idx: torch.FloatTensor
 ) -> Tuple[Tuple[torch.FloatTensor]]:
-    """select_idx: [B]"""
+    """
+    Extract the `past_key_value` for the selected tokens, each item in `past_key_value` is the 4-dimension matrix,
+    whose shape is [batch_size*K, num_head, seq_len, embed_dim], where K is the number of the candidate tokens. We aim
+    to obtain the `past_key_value` of the selected next token, whose shape is [batch_size, num_head, seq_len,
+    embed_dim]
+    """
     new_key_values = []
     for layer in past_key_values:
         items = []
+        # item is either the key or the value matrix
         for item in layer:
             bsz_and_beam, num_head, seq_len, esz = item.size()
             bsz = int(bsz_and_beam // beam_width)
@@ -3876,67 +3892,3 @@ def select_past_key_values(
             items.append(item)
         new_key_values.append(items)
     return new_key_values
-
-
-# encoder-decoder contrastive utils function
-def EncDecContrastiveDecodingOneStepFast(
-    model,
-    beam_width: int = 1,
-    penalty_alpha: float = 0.0,
-    past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
-    last_hidden_states: torch.FloatTensor = None,
-    logit_for_next_step: torch.FloatTensor = None,
-    **model_inputs,
-):
-    bsz, seqlen, embed_dim = last_hidden_states.size()
-    next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
-    _, top_k_ids = torch.topk(logit_for_next_step, dim=-1, k=beam_width)  # [B, K]
-    top_k_probs = torch.gather(next_probs, dim=1, index=top_k_ids)  # [B, K]
-    past_key_values = enlarge_past_key_values(past_key_values, beam_width)
-
-    # encoder attention mask
-    attention_mask = model_inputs["attention_mask"]  # [B, S]
-    attention_mask = (
-        attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
-    )  # [B*K, S]
-
-    next_model_inputs = {
-        "encoder_outputs": model_inputs["encoder_outputs"],
-        "decoder_input_ids": top_k_ids.contiguous().view(-1, 1),
-        "past_key_values": past_key_values,
-        "use_cache": True,
-        "output_hidden_states": True,
-        "attention_mask": attention_mask,
-    }
-
-    output = model(**next_model_inputs)
-    past_key_values = output.past_key_values
-    logits = output.logits[:, -1, :]  # [B*K, V]
-    next_hidden = output.decoder_hidden_states[-1]  # [B*K, 1, E]
-    context_hidden = (
-        last_hidden_states.unsqueeze(1).expand(-1, beam_width, -1, -1).reshape(bsz * beam_width, seqlen, embed_dim)
-    )  # [B*K, S, E]
-
-    selected_scores, selected_idx = ranking_fast(
-        context_hidden,
-        next_hidden,
-        top_k_probs,  # [B, K]
-        penalty_alpha,
-        beam_width,
-    )  # [B]
-    # prepare for the next step
-    next_id = top_k_ids[range(len(top_k_ids)), selected_idx].unsqueeze(-1)  # [B, 1]
-    next_hidden = torch.stack(torch.split(next_hidden.squeeze(dim=1), beam_width))  # [B, K, E]
-    next_hidden = next_hidden[range(bsz), selected_idx, :]  # [B, E]
-    last_hidden_states = torch.cat([last_hidden_states, next_hidden.unsqueeze(1)], dim=1)  # [B, S, E]
-
-    decoder_hidden_states = []
-    for layer in output.decoder_hidden_states:
-        layer = torch.stack(torch.split(layer.squeeze(dim=1), beam_width))  # [B, K, E]
-        layer = layer[range(bsz), selected_idx, :]  # [B, E]
-        decoder_hidden_states.append(layer)
-
-    past_key_values = select_past_key_values(past_key_values, beam_width, selected_idx)
-    logits = torch.stack(torch.split(logits, beam_width))[range(bsz), selected_idx, :]  # [B, V]
-    return next_id.squeeze(dim=-1), past_key_values, last_hidden_states, logits, selected_scores, decoder_hidden_states
-
