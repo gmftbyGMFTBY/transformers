@@ -14,11 +14,11 @@ from transformers import (
 def move_data_to_cuda(data):
     new_data = {}
     for key, value in data.items():
-        try:
-            value = value.cuda()
-            new_data[key] = value
-        except:
-            new_data[key] = value
+        # try:
+        value = value.cuda()
+        new_data[key] = value
+        # except:
+        #     new_data[key] = value
     return new_data
 
 
