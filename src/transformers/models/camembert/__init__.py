@@ -80,6 +80,7 @@ else:
         "TFCamembertForSequenceClassification",
         "TFCamembertForTokenClassification",
         "TFCamembertModel",
+        "TFCamembertPreTrainedModel",
     ]
 
 
@@ -134,6 +135,7 @@ if TYPE_CHECKING:
             TFCamembertForSequenceClassification,
             TFCamembertForTokenClassification,
             TFCamembertModel,
+            TFCamembertPreTrainedModel,
         )
 
 else:
