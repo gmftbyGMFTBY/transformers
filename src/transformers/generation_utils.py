@@ -3787,13 +3787,6 @@ def ContrastiveDecodingOneStepFast(
         attention_mask = torch.cat([attention_mask, attention_mask.new_ones((bsz, 1))], dim=-1)
     attention_mask = attention_mask.unsqueeze(1).expand(-1, beam_width, -1).reshape(-1, attention_mask.size(-1))
 
-    # OPT model does not contain the position_ids
-    if "position_ids" in model_inputs:
-        position_ids = model_inputs["position_ids"][:, -1] + 1
-        position_ids = position_ids.unsqueeze(dim=-1).expand(-1, beam_width)
-        position_ids = position_ids.reshape(-1, 1)
-    else:
-        position_ids = None
     # encoder-decoder model also contains the `encoder_outputs`
     if is_encoder_decoder and "encoder_outputs" in model_inputs:
         encoder_outputs = model_inputs["encoder_outputs"]
@@ -3803,7 +3796,6 @@ def ContrastiveDecodingOneStepFast(
         top_k_ids.view(-1, 1),
         past=past_key_values,
         attention_mask=attention_mask,
-        position_ids=position_ids,
         use_cache=True,
         encoder_outputs=encoder_outputs,
     )

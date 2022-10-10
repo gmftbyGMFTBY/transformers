@@ -31,7 +31,7 @@ tokenizer.pad_token = tokenizer.eos_token
 model = OPTForCausalLM.from_pretrained("facebook/opt-350m")
 model.cuda()
 
-inputs = tokenizer(["DeepMind Company is", "Microsoft Company is"], return_tensors="pt", padding=True)
+inputs = tokenizer(["DeepMind Company is", "Microsoft Company is an American"], return_tensors="pt", padding=True)
 inputs = move_data_to_cuda(inputs)
 
 # generation_output = model.generate(**inputs, return_dict_in_generate=True, output_scores=True, penalty_alpha=0.6, top_k=4, stopping_criteria=stopping_criteria, output_hidden_states=True)
